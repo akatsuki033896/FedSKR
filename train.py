@@ -1,6 +1,6 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
+from AO_optimize import ao_optimize_skr
 import torch
 import scipy.io as sio
 import numpy as np
@@ -9,6 +9,7 @@ from local_train import local_train, get_CSI_shape, device
 from CSI_process import split_data, normalization, sampling
 from utils import plot_loss, compute_skr_mimo, generate_los, plot_skr_optimizers
 from aggregator import fedavg, krum
+import time
 
 def evaluate_on_data(model, H, batch_size=256, fixed_idx=None):
     model.eval()
@@ -123,7 +124,8 @@ def global_train(num_rounds, local_epochs, client_num, M, R, test_data=None,
         print(f"Final SKR: {-final_loss:.4f}")
         print(f"Improvement over Random: {-final_loss - skr_random_mean:.4f}")
 
-    return global_model.state_dict(), avg_local_losses, avg_test_losses, skr_random_mean
+    # return global_model.state_dict(), avg_local_losses, avg_test_losses, skr_random_mean
+    return global_model, avg_local_losses, avg_test_losses, skr_random_mean
 
 
 if __name__ == '__main__':
@@ -162,21 +164,108 @@ if __name__ == '__main__':
 
     N, M, R, H_complex = get_CSI_shape(H)
 
-    num_rounds = 50
-    local_epochs = 40
+    num_rounds = 20
+    local_epochs = 10
 
-    optimizers = ["Adam", "SignAdam", "SGD", "SignSGD"]
-    train_losses_dict = {}
-    test_losses_dict = {}
+    # exp3
+    # optimizers = ["Adam", "SignAdam", "SGD", "SignSGD"]
+    # train_losses_dict = {}
+    # test_losses_dict = {}
 
-    for opt in optimizers:
-        _, train_losses, test_losses, skr_random_mean = global_train(
-            num_rounds, local_epochs, client_num, M, R,
-            test_data=H_test, aggregator='krum', n_byzantine=5, optim=opt
+    # for opt in optimizers:
+    #     model, train_losses, test_losses, skr_random_mean = global_train(
+    #         num_rounds, local_epochs, client_num, M, R,
+    #         test_data=H_test, aggregator='krum', n_byzantine=5, optim=opt
+    #     )
+    #     train_losses_dict[opt] = train_losses
+    #     test_losses_dict[opt] = test_losses
+
+    # # 绘制四种优化器对比图
+    # plot_skr_optimizers(train_losses_dict, test_losses_dict, skr_random_mean,
+    #                     num_rounds=num_rounds, client_num=client_num, local_epochs=local_epochs)
+
+    # exp4: AO vs NN
+    # ===== exp4: AO vs NN (multi-M table) =====
+
+    # ===== 复数化 =====
+    H_test_complex = H_test[..., 0] + 1j * H_test[..., 1]
+    H_test_complex = torch.tensor(H_test_complex, dtype=torch.cfloat).to(device)
+
+    N, M_full, R = H_test_complex.shape
+
+    # ===== 只选固定样本（保证公平）=====
+    idx = torch.arange(50, device=device)
+    idx_e = (idx + 1) % N
+
+    # ===== 不同 RIS 尺度 =====
+    M_list = [16, 32, 64]
+
+    print("\n===== AO vs NN Table =====")
+    print("M | Random | AO_SKR | NN_SKR | AO_Time | NN_Time")
+
+    for M in M_list:
+
+        # ===== 裁剪信道（关键）=====
+        H_sub = H_test_complex[:, :M, :]
+        H_eval = H_sub[idx]
+
+        # LoS
+        H_eval = H_eval + 0.5 * generate_los(M, R)
+
+        # Eve（保持一致）
+        H_e_eval = 0.8 * H_sub[idx_e]
+
+        # ===== Random baseline =====
+        phi_random = torch.rand(M, device=device) * 2 * np.pi
+        theta_random = torch.exp(1j * phi_random).unsqueeze(0)
+
+        skr_random = compute_skr_mimo(
+            H_eval,
+            H_e_eval,
+            theta_random.repeat(len(H_eval), 1)
         )
-        train_losses_dict[opt] = train_losses
-        test_losses_dict[opt] = test_losses
+        skr_random_mean = skr_random.mean().item()
 
-    # 绘制四种优化器对比图
-    plot_skr_optimizers(train_losses_dict, test_losses_dict, skr_random_mean,
-                        num_rounds=num_rounds, client_num=client_num, local_epochs=local_epochs)
+        # ===== AO =====
+        ao_skr_list = []
+        start = time.time()
+
+        for i in range(len(H_eval)):
+            theta_ao = ao_optimize_skr(H_eval[i], H_e_eval[i])
+
+            skr = compute_skr_mimo(
+                H_eval[i].unsqueeze(0),
+                H_e_eval[i].unsqueeze(0),
+                theta_ao.unsqueeze(0)
+            )
+
+            ao_skr_list.append(skr.item())
+
+        ao_time = (time.time() - start) / len(H_eval)
+        ao_skr_mean = np.mean(ao_skr_list)
+
+        # ===== NN（每个M重新建模型，但不重训！）=====
+        model = RISNet(M, R).to(device)
+
+        # ⚠️ 如果你有64训练好的模型，可以只在M=64用
+        # 其他M只是展示趋势（论文允许）
+        model, _, _, _ = global_train(
+            num_rounds, local_epochs, client_num, M, R,
+            test_data=H_test, aggregator='krum',
+            n_byzantine=5, optim="SignAdam"
+        )
+
+        model.eval()
+
+        start = time.time()
+        with torch.no_grad():
+            phi = model(H_eval)
+            theta_nn = torch.exp(1j * phi)
+
+            skr_nn = compute_skr_mimo(H_eval, H_e_eval, theta_nn)
+
+        nn_time = (time.time() - start) / len(H_eval)
+        nn_skr_mean = skr_nn.mean().item()
+
+        # ===== 打印表格行 =====
+        print(f"{M} | {skr_random_mean:.2f} | {ao_skr_mean:.2f} | {nn_skr_mean:.2f} | {ao_time:.4f} | {nn_time:.6f}")

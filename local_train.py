@@ -4,7 +4,6 @@ from utils import compute_skr_mimo, get_CSI_shape, generate_los
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
 def local_train(model, H, epochs, lr=1e-3, optim="Adam", batch_size=256):
     model.train()
     model = model.to(device)

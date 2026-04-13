@@ -3,21 +3,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-# supervised test
-# class MLP(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.fc = nn.Sequential(
-#             nn.Linear(64 * 4 * 2, 128),
-#             nn.ReLU(),
-#             nn.Linear(128, 1)
-#         )
-
-#     def forward(self, x):
-#         x = x.reshape(x.size(0), -1)
-#         return self.fc(x).squeeze()
-
-
 # class RISphase(nn.Module):
 #     def __init__(self, M):
 #         super().__init__()
